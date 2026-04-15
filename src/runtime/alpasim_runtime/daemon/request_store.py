@@ -17,6 +17,7 @@ class RequestState:
     pending_jobs: int
     results: list[JobResult]
     completion: asyncio.Future[list[JobResult]]
+    abandoned: bool = False
 
 
 class RequestStore:
@@ -86,10 +87,10 @@ class RequestStore:
         try:
             return await state.completion
         except asyncio.CancelledError:
-            # Keep request state alive — jobs may still complete.
-            # TODO: completed-but-unreaped requests will leak memory. Add an
-            #  explicit cancel/drain path to periodically clean up abandoned
-            #  request state.
+            # Keep request state alive — jobs may still complete.  Mark it
+            # abandoned so the reaper can distinguish it from a request whose
+            # waiter simply hasn't resumed yet after the future resolved.
+            state.abandoned = True
             raise
         finally:
             if state.completion.done():
@@ -101,6 +102,33 @@ class RequestStore:
             raise RuntimeError(f"Unknown request_id: {request_id}")
         if not state.completion.done():
             state.completion.set_exception(RuntimeError(message))
+
+    def reap_abandoned(self) -> int:
+        """Remove completed requests whose waiters were cancelled.
+
+        Only entries explicitly marked ``abandoned`` by a cancelled
+        ``wait_for_completion`` are reaped.  Requests whose future is merely
+        ``done()`` are left alone: the waiter may still be scheduled to
+        resume on the event loop, or the caller may not have called
+        ``wait_for_completion`` yet.
+
+        Returns the number of reaped entries.  Safe to call periodically
+        (e.g. after each simulation step) to bound memory growth from
+        client disconnects.
+        """
+        abandoned = [
+            rid
+            for rid, state in self._requests.items()
+            if state.abandoned and state.completion.done()
+        ]
+        for rid in abandoned:
+            del self._requests[rid]
+        return len(abandoned)
+
+    @property
+    def active_request_count(self) -> int:
+        """Number of requests currently tracked (pending + abandoned)."""
+        return len(self._requests)
 
     def fail_all_requests(self, message: str) -> None:
         for state in self._requests.values():
